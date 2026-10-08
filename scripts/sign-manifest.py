@@ -2,8 +2,9 @@
 
 Usage: sign-manifest.py <version> <assets-dir> <public-key-hex-file> <output-dir>
 
-Every file named Zalohuj-<version>-<platform>.<ext> in <assets-dir> becomes one
-platform entry. The Ed25519 PEM arrives in ZALOHUJ_SIGNING_PEM and is held in
+Every file named Zalohuj-<file-version>-<platform>.<ext> in <assets-dir> becomes
+one platform entry; <file-version> is the version with "+" replaced by ".",
+because GitHub cannot serve an asset whose name holds a "+". The Ed25519 PEM arrives in ZALOHUJ_SIGNING_PEM and is held in
 memory only. The payload format must match SignedRelease in
 zalohuj-ui/src/update.rs.
 """
@@ -54,6 +55,7 @@ def main() -> None:
     if derived != pin:
         raise SystemExit("signing key does not match the pinned update public key")
 
+    file_version = version.replace("+", ".")
     platforms = {}
     sums = []
     for file in sorted(assets.iterdir()):
@@ -66,7 +68,7 @@ def main() -> None:
             digest = hashlib.file_digest(source, "sha256").hexdigest()
         sums.append(f"{digest}  {file.name}")
         for platform, suffix in UPDATER_ASSET.items():
-            if file.name == f"Zalohuj-{version}-{platform}{suffix}":
+            if file.name == f"Zalohuj-{file_version}-{platform}{suffix}":
                 platforms[platform] = {
                     "url": f"{RELEASE_URL}/v{version}/{file.name}",
                     "sha256": digest,

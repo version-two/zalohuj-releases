@@ -70,7 +70,7 @@ jobs:
         run: |
           set -euo pipefail
           if ! gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release create "v$VERSION" --repo "$GITHUB_REPOSITORY" --draft --title "Zálohuj $VERSION" \
+            gh release create "v$VERSION" --repo "$GITHUB_REPOSITORY" --draft --target main --title "Zálohuj $VERSION" \
               --notes "Client build $VERSION from sk.zalohuj.client@$CLIENT_SHA."
           fi
 
@@ -146,7 +146,8 @@ jobs:
           set -euo pipefail
           B="client/target/${{ matrix.target }}/release/bundle"
           OUT="$RUNNER_TEMP/assets"; mkdir -p "$OUT"
-          P="Zalohuj-$ZALOHUJ_FULL_VERSION-${{ matrix.platform }}"
+          # GitHub cannot serve assets whose name holds a "+", so the file version uses a dot.
+          P="Zalohuj-${ZALOHUJ_FULL_VERSION/+/.}-${{ matrix.platform }}"
           case "${{ matrix.platform }}" in
             linux-*)
               cp "$B"/appimage/*.AppImage "$OUT/$P.AppImage"
