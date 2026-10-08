@@ -1,0 +1,213 @@
+name: Client release
+
+# One run per TeamCity client build. TeamCity creates the draft release, uploads
+# the Windows installer and dispatches this workflow with the version it minted;
+# nothing here invents a version. The release is published only after every
+# requested platform and the signed manifest are attached.
+
+on:
+  repository_dispatch:
+    types: [client-release]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Full client version, e.g. 1.0.0+140"
+        required: true
+      client_sha:
+        description: "sk.zalohuj.client commit to build"
+        required: true
+      platforms:
+        description: "Comma-separated subset of linux,macos"
+        default: linux
+      publish:
+        description: "Publish the draft release at the end"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.client_payload.version || inputs.version }}
+  cancel-in-progress: false
+
+env:
+  VERSION: ${{ github.event.client_payload.version || inputs.version }}
+  CLIENT_SHA: ${{ github.event.client_payload.client_sha || inputs.client_sha }}
+  PLATFORMS: ${{ github.event.client_payload.platforms || inputs.platforms || 'linux' }}
+  PUBLISH: ${{ github.event.client_payload.publish || inputs.publish }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ env.VERSION }}
+      client_sha: ${{ env.CLIENT_SHA }}
+      build_number: ${{ steps.meta.outputs.build_number }}
+      matrix: ${{ steps.meta.outputs.matrix }}
+    steps:
+      - id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+\+[0-9]+$ ]] || { echo "bad version: $VERSION"; exit 1; }
+          [[ "$CLIENT_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "bad client sha: $CLIENT_SHA"; exit 1; }
+          echo "build_number=${VERSION##*+}" >> "$GITHUB_OUTPUT"
+          entries=()
+          if [[ ",$PLATFORMS," == *,linux,* ]]; then
+            entries+=('{"runner":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu","platform":"linux-x86_64","bundles":"appimage,deb"}')
+            entries+=('{"runner":"ubuntu-24.04-arm","target":"aarch64-unknown-linux-gnu","platform":"linux-aarch64","bundles":"appimage,deb"}')
+          fi
+          if [[ ",$PLATFORMS," == *,macos,* ]]; then
+            entries+=('{"runner":"macos-15","target":"aarch64-apple-darwin","platform":"darwin-aarch64","bundles":"app,dmg"}')
+            entries+=('{"runner":"macos-15-intel","target":"x86_64-apple-darwin","platform":"darwin-x86_64","bundles":"app,dmg"}')
+          fi
+          [[ ${#entries[@]} -gt 0 ]] || { echo "no platform selected"; exit 1; }
+          printf 'matrix={"include":[%s]}\n' "$(IFS=,; echo "${entries[*]}")" >> "$GITHUB_OUTPUT"
+      - name: Ensure the draft release exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "v$VERSION" --repo "$GITHUB_REPOSITORY" --draft --title "Zálohuj $VERSION" \
+              --notes "Client build $VERSION from sk.zalohuj.client@$CLIENT_SHA."
+          fi
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    env:
+      ZALOHUJ_FULL_VERSION: ${{ needs.prepare.outputs.version }}
+      ZALOHUJ_BUILD_NUMBER: ${{ needs.prepare.outputs.build_number }}
+    steps:
+      - name: Check out sk.zalohuj.client
+        uses: actions/checkout@v4
+        with:
+          repository: version-two/sk.zalohuj.client
+          ref: ${{ needs.prepare.outputs.client_sha }}
+          ssh-key: ${{ secrets.CLIENT_REPO_SSH_KEY }}
+          path: client
+
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client/crates/zalohuj-ui/ui/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: client
+          key: ${{ matrix.target }}
+
+      - name: Install tauri-cli
+        run: cargo install --locked tauri-cli --version "^2"
+
+      - name: Frontend
+        working-directory: client/crates/zalohuj-ui/ui
+        run: |
+          npm ci
+          npm run build
+
+      - name: Daemon sidecar
+        working-directory: client
+        run: |
+          set -euo pipefail
+          export ZALOHUJ_UPDATE_PUBLIC_KEY="$(tr -d '[:space:]' < update-public-key.hex)"
+          cargo build --release --target "${{ matrix.target }}" --bin zalohuj-daemon
+          mkdir -p crates/zalohuj-ui/binaries
+          cp "target/${{ matrix.target }}/release/zalohuj-daemon" "crates/zalohuj-ui/binaries/zalohuj-daemon-${{ matrix.target }}"
+
+      - name: Tauri bundle
+        working-directory: client/crates/zalohuj-ui
+        run: |
+          set -euo pipefail
+          export ZALOHUJ_UPDATE_PUBLIC_KEY="$(tr -d '[:space:]' < ../../update-public-key.hex)"
+          cargo tauri build --target "${{ matrix.target }}" --bundles "${{ matrix.bundles }}"
+
+      - name: Collect artifacts
+        id: collect
+        shell: bash
+        run: |
+          set -euo pipefail
+          B="client/target/${{ matrix.target }}/release/bundle"
+          OUT="$RUNNER_TEMP/assets"; mkdir -p "$OUT"
+          P="Zalohuj-$ZALOHUJ_FULL_VERSION-${{ matrix.platform }}"
+          case "${{ matrix.platform }}" in
+            linux-*)
+              cp "$B"/appimage/*.AppImage "$OUT/$P.AppImage"
+              cp "$B"/deb/*.deb "$OUT/$P.deb"
+              ;;
+            darwin-*)
+              tar -C "$B/macos" -czf "$OUT/$P.app.tar.gz" Zalohuj.app
+              cp "$B"/dmg/*.dmg "$OUT/$P.dmg"
+              ;;
+          esac
+          ls -la "$OUT"
+          echo "dir=$OUT" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "v$ZALOHUJ_FULL_VERSION" --repo "$GITHUB_REPOSITORY" --clobber "${{ steps.collect.outputs.dir }}"/*
+
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out the client pin
+        uses: actions/checkout@v4
+        with:
+          repository: version-two/sk.zalohuj.client
+          ref: ${{ needs.prepare.outputs.client_sha }}
+          ssh-key: ${{ secrets.CLIENT_REPO_SSH_KEY }}
+          path: client
+          sparse-checkout: update-public-key.hex
+          sparse-checkout-cone-mode: false
+
+      - name: Download every asset of the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir assets
+          gh release download "v$VERSION" --repo "$GITHUB_REPOSITORY" --dir assets
+          rm -f assets/latest.json assets/SHA256SUMS
+          ls -la assets
+
+      - name: Sign the update manifest
+        env:
+          ZALOHUJ_SIGNING_PEM: ${{ secrets.ZALOHUJ_SIGNING_PEM }}
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet cryptography
+          python3 scripts/sign-manifest.py "$VERSION" assets client/update-public-key.hex out
+          cat out/latest.json
+
+      - name: Attach manifest and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release upload "v$VERSION" --repo "$GITHUB_REPOSITORY" --clobber out/latest.json out/SHA256SUMS
+          if [[ "$PUBLISH" != "false" ]]; then
+            gh release edit "v$VERSION" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          fi
